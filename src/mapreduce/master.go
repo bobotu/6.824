@@ -33,7 +33,6 @@ func (mr *Master) Register(args *RegisterArgs, _ *struct{}) error {
 	mr.Lock()
 	defer mr.Unlock()
 	debug("Register: worker %s\n", args.Worker)
-	mr.workers = append(mr.workers, args.Worker)
 	go func() {
 		mr.registerChannel <- args.Worker
 	}()
@@ -45,7 +44,7 @@ func newMaster(master string) (mr *Master) {
 	mr = new(Master)
 	mr.address = master
 	mr.shutdown = make(chan struct{})
-	mr.registerChannel = make(chan string)
+	mr.registerChannel = make(chan string, 10)
 	mr.doneChannel = make(chan bool)
 	return
 }

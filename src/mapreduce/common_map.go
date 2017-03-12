@@ -1,7 +1,12 @@
 package mapreduce
 
 import (
+	"encoding/json"
 	"hash/fnv"
+	"io/ioutil"
+	"os"
+	"sync"
+	"unsafe"
 )
 
 // doMap does the job of a map worker: it reads one of the input files
@@ -13,7 +18,7 @@ func doMap(
 	inFile string,
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(file string, contents string) []KeyValue,
-) {
+) error {
 	// TODO:
 	// You will need to write this function.
 	// You can find the filename for this map task's input to reduce task number
@@ -40,6 +45,61 @@ func doMap(
 	//     err := enc.Encode(&kv)
 	//
 	// Remember to close the file after you have written all the values!
+
+	debug("%s map job start\n", jobName)
+
+	var wg sync.WaitGroup
+	saveWorker := make([]chan KeyValue, nReduce)
+
+	for i := range saveWorker {
+		wg.Add(1)
+		saveWorker[i] = make(chan KeyValue, 10)
+		go func(i int, c <-chan KeyValue) {
+			f, _ := os.OpenFile(reduceName(jobName, mapTaskNumber, i), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
+			enc := json.NewEncoder(f)
+
+			for kv := range c {
+				if err := enc.Encode(kv); err != nil {
+					debug("%s\n", err.Error())
+				} else {
+					debug("%d save one kv %v\n", i, kv)
+				}
+			}
+
+			f.Close()
+			debug("%s closed\n", reduceName(jobName, mapTaskNumber, i))
+			wg.Done()
+		}(i, saveWorker[i])
+	}
+
+	f, err := os.Open(inFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	b, err := ioutil.ReadAll(f)
+	if err != nil {
+		return err
+	}
+
+	content := *((*string)(unsafe.Pointer(&b)))
+	result := mapF(inFile, content)
+
+	for _, kv := range result {
+		r := ihash(kv.Key) % uint32(nReduce)
+		saveWorker[r] <- kv
+		debug("send %v\n", kv)
+	}
+
+	for _, c := range saveWorker {
+		close(c)
+	}
+
+	wg.Wait()
+	debug("%d done\n", mapTaskNumber)
+
+	return nil
 }
 
 func ihash(s string) uint32 {

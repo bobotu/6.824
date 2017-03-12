@@ -27,15 +27,17 @@ func (wk *Worker) DoTask(arg *DoTaskArgs, _ *struct{}) error {
 	fmt.Printf("%s: given %v task #%d on file %s (nios: %d)\n",
 		wk.name, arg.Phase, arg.TaskNumber, arg.File, arg.NumOtherPhase)
 
+	var err error
+
 	switch arg.Phase {
 	case mapPhase:
-		doMap(arg.JobName, arg.TaskNumber, arg.File, arg.NumOtherPhase, wk.Map)
+		err = doMap(arg.JobName, arg.TaskNumber, arg.File, arg.NumOtherPhase, wk.Map)
 	case reducePhase:
-		doReduce(arg.JobName, arg.TaskNumber, arg.NumOtherPhase, wk.Reduce)
+		err = doReduce(arg.JobName, arg.TaskNumber, arg.NumOtherPhase, wk.Reduce)
 	}
 
 	fmt.Printf("%s: %v task #%d done\n", wk.name, arg.Phase, arg.TaskNumber)
-	return nil
+	return err
 }
 
 // Shutdown is called by the master when all work has been completed.

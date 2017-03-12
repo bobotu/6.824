@@ -1,5 +1,11 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"log"
+	"os"
+)
+
 // doReduce does the job of a reduce worker: it reads the intermediate
 // key/value pairs (produced by the map phase) for this task, sorts the
 // intermediate key/value pairs by key, calls the user-defined reduce function
@@ -9,7 +15,7 @@ func doReduce(
 	reduceTaskNumber int, // which reduce task this is
 	nMap int, // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string,
-) {
+) error {
 	// TODO:
 	// You will need to write this function.
 	// You can find the intermediate file for this reduce task from map task number
@@ -31,4 +37,40 @@ func doReduce(
 	// 	enc.Encode(KeyValue{key, reduceF(...)})
 	// }
 	// file.Close()
+
+	out, err := os.OpenFile(mergeName(jobName, reduceTaskNumber), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	m := make(map[string][]string)
+
+	for i := 0; i < nMap; i++ {
+		f, err := os.OpenFile(reduceName(jobName, i, reduceTaskNumber), os.O_RDONLY, 0666)
+		if err != nil {
+			return err
+		}
+		var kv KeyValue
+
+		dec := json.NewDecoder(f)
+		for dec.Decode(&kv) == nil {
+			if kv.Key == "" {
+				debug("%+v\n", kv)
+			}
+			m[kv.Key] = append(m[kv.Key], kv.Value)
+		}
+
+		f.Close()
+	}
+
+	enc := json.NewEncoder(out)
+
+	for k, v := range m {
+		if err := enc.Encode(KeyValue{Key: k, Value: reduceF(k, v)}); err != nil {
+			log.Println(err.Error())
+		}
+	}
+
+	return nil
 }
