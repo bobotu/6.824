@@ -1,12 +1,19 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
 	"labrpc"
 	"log"
 	"raft"
 	"sync"
+	"time"
+	"unsafe"
 )
+
+func init() {
+	gob.Register(Snapshot{})
+}
 
 const Debug = 0
 
@@ -17,11 +24,23 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	opPut = iota
+	opAppend
+	opGet
+)
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	OpType   int
+	Key      string
+	Value    string
+	UniqueID int64
+	PrevID   int64
+}
+
+type request struct {
+	term  int
+	reply chan string
 }
 
 type RaftKV struct {
@@ -30,18 +49,156 @@ type RaftKV struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 
+	kv map[string]string
+
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	requests  map[int64]request
+	duplicate map[int64]struct{}
 }
 
-
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{
+		OpType:   opGet,
+		Key:      args.Key,
+		UniqueID: args.UniqueID,
+		PrevID:   args.PrevID,
+	}
+
+	reply.WrongLeader = true
+
+	if term, isLeader := kv.rf.GetState(); isLeader {
+		resp := make(chan string, 1)
+		kv.mu.Lock()
+		kv.requests[args.UniqueID] = request{term, resp}
+		kv.mu.Unlock()
+		if _, _, isLeader = kv.rf.Start(op); isLeader {
+			for {
+				select {
+				case <-time.After(10 * time.Millisecond):
+					if ct, isLeader := kv.rf.GetState(); ct != term || !isLeader {
+						reply.WrongLeader = true
+						return
+					}
+				case reply.Value = <-resp:
+					reply.WrongLeader = false
+					return
+				}
+			}
+		}
+	}
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{
+		Key:      args.Key,
+		Value:    args.Value,
+		UniqueID: args.UniqueID,
+		PrevID:   args.PrevID,
+	}
+
+	reply.WrongLeader = true
+
+	if args.Op == "Put" {
+		op.OpType = opPut
+	} else {
+		op.OpType = opAppend
+	}
+
+	if term, isLeader := kv.rf.GetState(); isLeader {
+		resp := make(chan string, 1)
+
+		kv.mu.Lock()
+		kv.requests[args.UniqueID] = request{term, resp}
+		kv.mu.Unlock()
+
+		if _, _, isLeader = kv.rf.Start(op); isLeader {
+			for {
+				select {
+				case <-time.After(10 * time.Millisecond):
+					if ct, isLeader := kv.rf.GetState(); ct != term || !isLeader {
+						reply.WrongLeader = true
+						return
+					}
+				case <-resp:
+					reply.WrongLeader = false
+					return
+				}
+			}
+		}
+	}
+}
+
+type Snapshot struct {
+	KV         map[string]string
+	Duplicates map[int64]struct{}
+}
+
+func (kv *RaftKV) applyOpLoop() {
+	var stateSize int64
+	logSize := int64(unsafe.Sizeof(raft.Log{}))
+	for msg := range kv.applyCh {
+		if msg.UseSnapshot {
+			kv.mu.Lock()
+			var snap Snapshot
+			gob.NewDecoder(bytes.NewReader(msg.Snapshot)).Decode(&snap)
+			kv.kv = snap.KV
+			kv.duplicate = snap.Duplicates
+			kv.mu.Unlock()
+			continue
+		}
+
+		op := msg.Command.(Op)
+
+		var reply string
+
+		switch op.OpType {
+		case opPut:
+			if _, ex := kv.duplicate[op.UniqueID]; !ex {
+				kv.kv[op.Key] = op.Value
+			}
+		case opAppend:
+			if _, ex := kv.duplicate[op.UniqueID]; !ex {
+				kv.kv[op.Key] += op.Value
+			}
+		case opGet:
+			reply = kv.kv[op.Key]
+		}
+
+		kv.duplicate[op.UniqueID] = struct{}{}
+		delete(kv.duplicate, op.PrevID)
+
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.mu.Lock()
+
+			if req, ok := kv.requests[op.UniqueID]; ok {
+				delete(kv.requests, op.UniqueID)
+				DPrintf("reply\n")
+				req.reply <- reply
+				DPrintf("reply done\n")
+			}
+
+			kv.mu.Unlock()
+		}
+
+		stateSize += int64(unsafe.Sizeof(msg.Command)) + logSize
+
+		if kv.maxraftstate > 0 && stateSize > int64(kv.maxraftstate)/4*3 {
+			buf := bytes.NewBuffer(nil)
+			enc := gob.NewEncoder(buf)
+			enc.Encode(Snapshot{
+				KV:         kv.kv,
+				Duplicates: kv.duplicate,
+			})
+
+			kv.rf.SaveSnapshot(raft.Snapshot{
+				Index: msg.Index,
+				Data:  buf.Bytes(),
+			})
+
+			stateSize = 0
+		}
+	}
 }
 
 //
@@ -76,12 +233,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(RaftKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// Your initialization code here.
+	kv.kv = make(map[string]string)
+	kv.requests = make(map[int64]request)
+	kv.duplicate = make(map[int64]struct{})
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go kv.applyOpLoop()
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	return kv
 }

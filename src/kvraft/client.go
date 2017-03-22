@@ -1,13 +1,16 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+
+	supposedLeader int
+	prevID         int64
 }
 
 func nrand() int64 {
@@ -37,9 +40,26 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	args := GetArgs{
+		Key:      key,
+		UniqueID: nrand(),
+		PrevID:   ck.prevID,
+	}
 
-	// You will have to modify this function.
-	return ""
+	DPrintf("get %s start\n", key)
+
+	for {
+		total := len(ck.servers)
+		for i, l := 0, ck.supposedLeader; i < total; i, l = i+1, (l+1)%total {
+			var reply GetReply
+			if ok := ck.servers[i].Call("RaftKV.Get", &args, &reply); ok && !reply.WrongLeader {
+				ck.supposedLeader = i
+				ck.prevID = args.UniqueID
+				return reply.Value
+			}
+		}
+		DPrintf("no leader!\n")
+	}
 }
 
 //
@@ -53,7 +73,28 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:      key,
+		Op:       op,
+		Value:    value,
+		UniqueID: nrand(),
+		PrevID:   ck.prevID,
+	}
+
+	DPrintf("%s %s start\n", op, key)
+
+	for {
+		total := len(ck.servers)
+		for i, l := 0, ck.supposedLeader; i < total; i, l = i+1, (l+1)%total {
+			var reply PutAppendReply
+			if ok := ck.servers[i].Call("RaftKV.PutAppend", &args, &reply); ok && !reply.WrongLeader {
+				ck.supposedLeader = i
+				ck.prevID = args.UniqueID
+				return
+			}
+		}
+		DPrintf("no leader!\n")
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
