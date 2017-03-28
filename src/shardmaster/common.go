@@ -1,5 +1,9 @@
 package shardmaster
 
+import (
+	"encoding/gob"
+)
+
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -35,10 +39,19 @@ const (
 	OK = "OK"
 )
 
+func init() {
+	gob.Register(JoinArgs{})
+	gob.Register(LeaveArgs{})
+	gob.Register(MoveArgs{})
+	gob.Register(QueryArgs{})
+}
+
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	UniqueID int64
+	PrevID   int64
+	Servers  map[int][]string // new GID -> servers mappings
 }
 
 type JoinReply struct {
@@ -47,7 +60,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	UniqueID int64
+	PrevID   int64
+	GIDs     []int
 }
 
 type LeaveReply struct {
@@ -56,8 +71,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	UniqueID int64
+	PrevID   int64
+	Shard    int
+	GID      int
 }
 
 type MoveReply struct {
@@ -66,11 +83,102 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	UniqueID int64
+	PrevID   int64
+	Num      int // desired config number
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+func (cfg *Config) rebalance(removed []int) {
+	unused := cfg.unused()
+	empty := cfg.remove(removed)
+
+	for _, shard := range empty {
+		if len(unused) > 0 {
+			cfg.Shards[shard] = unused[0]
+			unused = unused[1:]
+		} else {
+			var i int
+			for i = shard + 1; cfg.Shards[i%NShards] == 0; i++ {
+				// find first no zero
+			}
+			cfg.Shards[shard] = cfg.Shards[i%NShards]
+		}
+	}
+
+	busier := cfg.busier()
+	var i int
+	for _, shard := range busier {
+		if len(unused) > 0 {
+			cfg.Shards[shard] = unused[0]
+			unused = unused[1:]
+		} else {
+			cfg.Shards[shard] = cfg.Shards[i%NShards]
+			i++
+		}
+	}
+}
+
+func (cfg *Config) remove(removed []int) []int {
+	empty := make([]int, 0)
+
+	for i, mapped := range cfg.Shards {
+		if mapped == 0 {
+			empty = append(empty, i)
+		} else {
+			for _, gid := range removed {
+				if mapped == gid {
+					cfg.Shards[i] = 0
+					empty = append(empty, i)
+					break
+				}
+			}
+		}
+	}
+
+	return empty
+}
+
+func (cfg *Config) unused() []int {
+	unused := make([]int, 0)
+
+	all := make([]int, 0, len(cfg.Groups))
+	for k := range cfg.Groups {
+		all = append(all, k)
+	}
+
+	for _, gid := range all {
+		f := true
+		for _, used := range cfg.Shards {
+			if used == gid {
+				f = false
+				break
+			}
+		}
+		if f {
+			unused = append(unused, gid)
+		}
+	}
+
+	return unused
+}
+
+func (cfg *Config) busier() []int {
+	busier := make([]int, 0)
+
+	counter := make(map[int]int, NShards)
+
+	for shard, gid := range cfg.Shards {
+		counter[gid]++
+		if counter[gid] >= 2 {
+			busier = append(busier, shard)
+		}
+	}
+
+	return busier
 }
